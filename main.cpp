@@ -8,6 +8,7 @@
  * --bip ip бэга
  * --port порт
  * --catalog каталог, куда будут писаться данные
+ * --dd запрещение записи пакетов данных на диск
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +36,7 @@ using namespace std;
 
 static struct {
 	bool isEnableWr; //разрешение записи на диск
+	bool isEnableWriteData; //разрешение записи пакетов данных да диск
 	int buf[LEN_RECEIVE_BUF];	//приёмный буфер
 	size_t len; //длина блока полезных данных(в байтах)
 	unsigned int nummad;	//количество мадов в системе
@@ -104,6 +106,11 @@ int main(int argc, char* argv[]) {
 	char ipBag[15] = BAG_IP;
 	unsigned int port = BAG_PORT;
 	string catalog = CATALOG;
+	statp.isEnableWr = true;
+	statp.isEnableWriteData = true;
+	statp.len = 0;
+	statp.nummad = 3;
+	statp.day = -1;
 	for (int i = 1; i < argc; i += 2) {
 		if (!strcmp("--bip", argv[i]))
 			strcpy(ipBag, argv[i + 1]);
@@ -111,7 +118,10 @@ int main(int argc, char* argv[]) {
 			port = atoi(argv[i + 1]);
 		else if (!strcmp("--catalog", argv[i]))
 			catalog = argv[i + 1];
-		else
+		else if (!strcmp("--dd", argv[i])) {
+			statp.isEnableWriteData = false;
+			--i;
+		} else
 			printf("%d параметр не поддерживается программой\n", i);
 	}
 	//инициализация сокета
@@ -125,7 +135,7 @@ int main(int argc, char* argv[]) {
 	bzero(&addr, sizeof(addr));
 	addr.sin_family = AF_INET;
 	addr.sin_port = htons(port);
-	addr.sin_addr.s_addr = htonl(INADDR_ANY );
+	addr.sin_addr.s_addr = htonl(INADDR_ANY);
 	if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr))) {
 		std::cerr << "socket  not bind\n";
 		exit(1);
@@ -133,15 +143,15 @@ int main(int argc, char* argv[]) {
 	//создание папок
 	for (int i = 0; i < 3; i++) {
 		mkdir((catalog + "/mad" + to_string(i + 1)).c_str(),
-				S_IRWXU | S_IRWXG | S_IRWXO);
+		S_IRWXU | S_IRWXG | S_IRWXO);
 		mkdir((catalog + "/mad" + to_string(i + 1) + "/data").c_str(),
-				S_IRWXU | S_IRWXG | S_IRWXO);
+		S_IRWXU | S_IRWXG | S_IRWXO);
 		mkdir((catalog + "/mad" + to_string(i + 1) + "/dispersion").c_str(),
-				S_IRWXU | S_IRWXG | S_IRWXO);
+		S_IRWXU | S_IRWXG | S_IRWXO);
 		mkdir((catalog + "/mad" + to_string(i + 1) + "/expectation").c_str(),
-				S_IRWXU | S_IRWXG | S_IRWXO);
+		S_IRWXU | S_IRWXG | S_IRWXO);
 		mkdir((catalog + "/mad" + to_string(i + 1) + "/test").c_str(),
-				S_IRWXU | S_IRWXG | S_IRWXO);
+		S_IRWXU | S_IRWXG | S_IRWXO);
 	}
 	//инициализация структур
 	mad mads[3] = { { "\033[34", catalog + "/mad1" + "/data", catalog + "/mad1"
@@ -152,10 +162,6 @@ int main(int argc, char* argv[]) {
 			"\033[36", catalog + "/mad3" + "/data", catalog + "/mad3"
 					+ "/dispersion", catalog + "/mad3" + "/expectation", catalog
 					+ "/mad3" + "/test", 3 } };
-	statp.isEnableWr = true;
-	statp.len = 0;
-	statp.nummad = 3;
-	statp.day = -1;
 	//ГЛАВНЫЙ ЦИКЛ ПРОГРАММЫ
 	int status = 0;
 	printf("hello\n");
@@ -274,19 +280,21 @@ void change_date(mad* mad, const int& num) {
 		//создание новых папок
 		for (int i = 0; i < num; i++) {
 			mkdir((mad[i].catalog_m_d + "/" + statp.name_month).c_str(),
-					S_IRWXU | S_IRWXG | S_IRWXO);
+			S_IRWXU | S_IRWXG | S_IRWXO);
 			mkdir((mad[i].catalog_m_e + "/" + statp.name_month).c_str(),
-					S_IRWXU | S_IRWXG | S_IRWXO);
+			S_IRWXU | S_IRWXG | S_IRWXO);
 			mkdir((mad[i].catalog_d + "/" + statp.name_month).c_str(),
-					S_IRWXU | S_IRWXG | S_IRWXO);
+			S_IRWXU | S_IRWXG | S_IRWXO);
 			mkdir((mad[i].catalog_t + "/" + statp.name_month).c_str(),
-					S_IRWXU | S_IRWXG | S_IRWXO);
+			S_IRWXU | S_IRWXG | S_IRWXO);
 		}
 
 	}
 }
 
 void hand_data(DataUnit* buf, size_t size, mad* mad, int idmad) {
+	if (!statp.isEnableWriteData)
+		return;
 	mad[idmad].f_d.open(
 			(mad[idmad].catalog_d + "/" + statp.name_month + "/"
 					+ to_string(buf->time) + "_" + to_string(buf->numFirstCount)
