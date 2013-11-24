@@ -9,6 +9,9 @@
  * --port порт
  * --catalog каталог, куда будут писаться данные
  * --dd запрещение записи пакетов данных на диск
+ * --portG порт оповещевателя Гасик
+ * --gasicDS режим набора данных
+ *
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,13 +29,18 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <iomanip>
+#include "Bag.h"
 
 #define BAG_IP "192.168.1.165"
 #define BAG_PORT 31011
+#define GASIC_PORT 33000 //порт, на который принимается сообщения о начале и завершении сеанса Гасик
 #define CATALOG "/home/x/file_of_andrej/data"
 #define LEN_RECEIVE_BUF 4100 //длина приёмного буфера
 #define SAMPLING_RATE 187500
 using namespace std;
+enum GasikMode { //режимы записи данных позиционирования
+	SINGLE_FILE, SEPARATE_FILES
+};
 
 static struct {
 	bool isEnableWr; //разрешение записи на диск
@@ -42,6 +50,7 @@ static struct {
 	unsigned int nummad;	//количество мадов в системе
 	string name_month; //название текущего месяца
 	int day; //текущий день
+	int gasikMode; //режим записи данных Гасика
 } statp;
 
 struct mad {
@@ -50,11 +59,13 @@ struct mad {
 	string catalog_m_d; //каталог, куда будут записываться файлы мониторограмм(дисперсия)
 	string catalog_m_e; //каталог, куда будут записываться файлы мониторограмм(среднее)
 	string catalog_t; //каталог, куда будут записываться файлы статистики алгоритмов
+	string catalog_g; //каталог, куда будут записываться файлы позиционирования на основе данных Гасик
 	unsigned int id; //идентификатор мада
 	ofstream f_d; //поток для файлов данных
 	ofstream f_m_d; //поток для файлов дисперсии
 	ofstream f_m_e; //поток для файлов средних
 	ofstream f_t; //поток для файлов статистики
+	ofstream f_g; //поток для файлов Гасик
 	int day_for_mon;
 	int day_for_stat;
 	string month;
@@ -73,6 +84,7 @@ struct Monitor {
 
 //ШАПКА СТРУКТУРЫ ПЕРЕДАЧИ ДАННЫХ
 #define SIGNAL_SAMPL 3	 //код, идентифицирующий блок данных сигнала
+#define SIGNAL_GASIC 6	 //код, идентифицирующий блок данных сигнала Гасик
 struct DataUnit {
 	unsigned int time;	//время отправления
 	int ident; //идентификатор блока данных
@@ -92,28 +104,42 @@ struct StatAlg {
 	unsigned average; //среднее количество пакетов в памяти за период измерения
 	unsigned int id_MAD; //идентификатор МАДа
 };
+//СООБЩЕНИЯ ОПОВЕЩЕВАТЕЛЯ ГАСИК
+enum {
+	FROM_GASIC_STOP, FROM_GASIC_START
+};
+
+//СТРУКТУРА УПРАВЛЯЮЩИХ ПАКЕТОВ РЕЖИМА ГАСИК, ОТПРАВЛЯЕМЫХ ИЗ БЭГ В БЦ
+#define CONTROL_GASIC 7	 //код, идентифицирующий блок данных сигнала Гасик
+/*структура управляющих пакетов Гасик не определена*/
+
+sockaddr_in addrBag;
 
 static void hand_command(void);
-static void hand_socket(int& s, mad* mad, const int& num);
+static void hand_socket(int& s, mad* mad, const int& num, mad_n::Bag& bag);
+static void hand_socketGas(int& s, mad_n::Bag& bag); //обработка сообщения оповещевателя Гасик
 static void hand_monitor(Monitor* buf, size_t size, mad* mad, int idmad); //обработчик мониторограмм
 static void hand_stat(StatAlg* buf, size_t size, mad* mad, int idmad); //обработчик статистики алгоритма
 static void change_date(mad* mad, const int& num); //функция изменения временных меток
 static void hand_data(DataUnit* buf, size_t size, mad* mad, int idmad);	//обработчик пакетов данных
+static void hand_data_gasik(DataUnit* buf, size_t size, mad* mad, int idmad);//обработчик пакетов данных Гасик
 static void message_about_receiv(mad* mad, DataUnit* buf); //выводит на консоль информацию о детектированном событии
 
 int main(int argc, char* argv[]) {
 	fd_set fdin; //набор дескрипторов, на которых ожидаются входные данные
-	char ipBag[15] = BAG_IP;
-	unsigned int port = BAG_PORT;
+	string ipBag = BAG_IP; //содержит ip адрес БЭГ;
+	unsigned int port = BAG_PORT; //порт БЭГ
+	unsigned int portG = GASIC_PORT;
 	string catalog = CATALOG;
 	statp.isEnableWr = true;
 	statp.isEnableWriteData = true;
 	statp.len = 0;
 	statp.nummad = 3;
 	statp.day = -1;
+	statp.gasikMode = SEPARATE_FILES;
 	for (int i = 1; i < argc; i += 2) {
 		if (!strcmp("--bip", argv[i]))
-			strcpy(ipBag, argv[i + 1]);
+			ipBag = argv[i + 1];
 		else if (!strcmp("--port", argv[i]))
 			port = atoi(argv[i + 1]);
 		else if (!strcmp("--catalog", argv[i]))
@@ -121,10 +147,25 @@ int main(int argc, char* argv[]) {
 		else if (!strcmp("--dd", argv[i])) {
 			statp.isEnableWriteData = false;
 			--i;
+		} else if (!strcmp("--portG", argv[i]))
+			portG = atoi(argv[i + 1]);
+		else if (!strcmp("--gasicDS", argv[i])) {
+			int mode = atoi(argv[i + 1]);
+			if (mode == SINGLE_FILE || mode == SEPARATE_FILES)
+				statp.gasikMode = mode;
+			else
+				cout << "Режима " << mode
+						<< " записи данных Гасик не существует";
 		} else
 			printf("%d параметр не поддерживается программой\n", i);
 	}
-	//инициализация сокета
+
+	//инициализация адреса БЭГ
+	bzero(&addrBag, sizeof(addrBag));
+	addrBag.sin_family = AF_INET;
+	addrBag.sin_port = htons(port);
+	inet_pton(AF_INET, ipBag.c_str(), &addrBag.sin_addr);
+	//инициализация сокета приёма данных от акустики
 	int sock;
 	sock = socket(AF_INET, SOCK_DGRAM, 0); //сокет приёма
 	if (sock == -1) {
@@ -140,6 +181,23 @@ int main(int argc, char* argv[]) {
 		std::cerr << "socket  not bind\n";
 		exit(1);
 	}
+	//инициализация сокета приёма данных от оповещевателя Гасик
+	int sockGas;
+	sockGas = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sockGas == -1) {
+		std::cerr << "socket  not create\n";
+		exit(1);
+	}
+	bzero(&addr, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(portG);
+	addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	if (bind(sockGas, reinterpret_cast<sockaddr*>(&addr), sizeof(addr))) {
+		std::cerr << "socket Gasic not bind\n";
+		exit(1);
+	}
+	//инициализация Bag объекта
+	mad_n::Bag bag(sock, addrBag);
 	//создание папок
 	for (int i = 0; i < 3; i++) {
 		mkdir((catalog + "/mad" + to_string(i + 1)).c_str(),
@@ -152,39 +210,47 @@ int main(int argc, char* argv[]) {
 		S_IRWXU | S_IRWXG | S_IRWXO);
 		mkdir((catalog + "/mad" + to_string(i + 1) + "/test").c_str(),
 		S_IRWXU | S_IRWXG | S_IRWXO);
+		mkdir((catalog + "/mad" + to_string(i + 1) + "/gasic").c_str(),
+		S_IRWXU | S_IRWXG | S_IRWXO);
 	}
 	//инициализация структур
 	mad mads[3] = { { "\033[34", catalog + "/mad1" + "/data", catalog + "/mad1"
 			+ "/dispersion", catalog + "/mad1" + "/expectation", catalog
-			+ "/mad1" + "/test", 1 }, { "\033[33", catalog + "/mad2" + "/data",
-			catalog + "/mad2" + "/dispersion", catalog + "/mad2"
-					+ "/expectation", catalog + "/mad2" + "/test", 2 }, {
-			"\033[36", catalog + "/mad3" + "/data", catalog + "/mad3"
-					+ "/dispersion", catalog + "/mad3" + "/expectation", catalog
-					+ "/mad3" + "/test", 3 } };
+			+ "/mad1" + "/test", catalog + "/mad1" + "/gasic", 1 }, { "\033[33",
+			catalog + "/mad2" + "/data", catalog + "/mad2" + "/dispersion",
+			catalog + "/mad2" + "/expectation", catalog + "/mad2" + "/test",
+			catalog + "/mad2" + "/gasic", 2 }, { "\033[36", catalog + "/mad3"
+			+ "/data", catalog + "/mad3" + "/dispersion", catalog + "/mad3"
+			+ "/expectation", catalog + "/mad3" + "/test", catalog + "/mad3"
+			+ "/gasic", 3 } };
 	//ГЛАВНЫЙ ЦИКЛ ПРОГРАММЫ
 	int status = 0;
-	printf("hello\n");
+	cout << "hello\n";
 	for (;;) {
 		//задание набора дескрипторов
 		FD_ZERO(&fdin);
 		FD_SET(STDIN_FILENO, &fdin);
 		FD_SET(sock, &fdin);
+		FD_SET(sockGas, &fdin);
 		//ожидание событий
-		status = select(sock + 1, &fdin, NULL, NULL, NULL);
+		status = select(sockGas + 1, &fdin, NULL, NULL, NULL);
 		if (status == -1) {
 			if (errno == EINTR)
 				continue;
 			else {
-				perror("Функция select завершилась крахом\n");
+				cerr << "Функция select завершилась крахом\n";
 				exit(1);
 			}
 		}
 		if (FD_ISSET(STDIN_FILENO, &fdin))
 			hand_command();
 		if (FD_ISSET(sock, &fdin)) {
-			hand_socket(sock, mads, 3);
-			printf("Приняты данные на сокете\n");
+			hand_socket(sock, mads, 3, bag);
+			cout << "Приняты данные на сокете\n";
+		}
+		if (FD_ISSET(sock, &fdin)) {
+			hand_socketGas(sockGas, bag);
+			cout << "Приняты данные на от оповещевателя Гасик\n";
 		}
 	}
 	return 0;
@@ -204,7 +270,7 @@ void hand_command(void) {
 }
 
 //обработчик пакетов от сокета
-void hand_socket(int& s, mad* mad, const int& num) {
+void hand_socket(int& s, mad* mad, const int& num, mad_n::Bag& bag) {
 	change_date(mad, num);
 	statp.len = recvfrom(s, reinterpret_cast<void *>(statp.buf),
 			sizeof(statp.buf), 0, NULL, NULL);
@@ -217,21 +283,31 @@ void hand_socket(int& s, mad* mad, const int& num) {
 			&& (reinterpret_cast<Monitor*>(statp.buf)->id_MAD <= statp.nummad)) {
 		hand_monitor(reinterpret_cast<Monitor*>(statp.buf), statp.len, mad,
 				reinterpret_cast<Monitor*>(statp.buf)->id_MAD - 1);
-		printf("Принята мониторограмма\n");
+		cout << "Принята мониторограмма\n";
 	} else if (statp.len > sizeof(DataUnit)
 			&& (reinterpret_cast<DataUnit*>(statp.buf)->ident == SIGNAL_SAMPL)
 			&& (reinterpret_cast<DataUnit*>(statp.buf)->id_MAD <= statp.nummad)) {
 		hand_data(reinterpret_cast<DataUnit*>(statp.buf), statp.len, mad,
 				reinterpret_cast<DataUnit*>(statp.buf)->id_MAD - 1);
-		printf("Принят блок данных\n");
+		cout << "Принят блок данных\n";
+	} else if (statp.len > sizeof(DataUnit)
+			&& (reinterpret_cast<DataUnit*>(statp.buf)->ident == SIGNAL_GASIC)
+			&& (reinterpret_cast<DataUnit*>(statp.buf)->id_MAD <= statp.nummad)) {
+		hand_data_gasik(reinterpret_cast<DataUnit*>(statp.buf), statp.len, mad,
+				reinterpret_cast<DataUnit*>(statp.buf)->id_MAD - 1);
+		cout << "Принят блок данных сигнала Гасик\n";
 	} else if (statp.len == sizeof(StatAlg)
 			&& (reinterpret_cast<StatAlg*>(statp.buf)->ident == STAT_ALG)
 			&& (reinterpret_cast<StatAlg*>(statp.buf)->id_MAD <= statp.nummad)) {
 		hand_stat(reinterpret_cast<StatAlg*>(statp.buf), statp.len, mad,
 				reinterpret_cast<StatAlg*>(statp.buf)->id_MAD - 1);
-		printf("Принят пакет статистики\n");
+		cout << "Принят пакет статистики\n";
+	} else if (statp.len != 0 && statp.buf[0] == CONTROL_GASIC) {
+		bag.passAnswerFromBag(&statp.buf[1],
+				sizeof(statp.len) / sizeof(int) - 1);
+
 	} else
-		printf("Принят неизвестный пакет данных\n");
+		cerr << "Принят неизвестный пакет данных\n";
 	statp.len = 0;
 
 	return;
@@ -287,6 +363,8 @@ void change_date(mad* mad, const int& num) {
 			S_IRWXU | S_IRWXG | S_IRWXO);
 			mkdir((mad[i].catalog_t + "/" + statp.name_month).c_str(),
 			S_IRWXU | S_IRWXG | S_IRWXO);
+			mkdir((mad[i].catalog_g + "/" + statp.name_month).c_str(),
+			S_IRWXU | S_IRWXG | S_IRWXO);
 		}
 
 	}
@@ -307,7 +385,40 @@ void hand_data(DataUnit* buf, size_t size, mad* mad, int idmad) {
 	return;
 }
 
+void hand_data_gasik(DataUnit* buf, size_t size, mad* mad, int idmad) {
+	if (!statp.isEnableWriteData)
+		return;
+	mad[idmad].f_g.open(
+			(mad[idmad].catalog_g + "/" + statp.name_month + "/"
+					+ to_string(buf->time) + "_" + to_string(buf->numFirstCount)
+					+ "_" + to_string(buf->id_MAD)).c_str(),
+			ios::out | ios::trunc | ios::binary);
+	mad[idmad].f_g.write((char*) ((int*) &(buf->id_MAD) + 1),
+			size - sizeof(DataUnit));
+	mad[idmad].f_g.close();
+	message_about_receiv(&mad[idmad], buf);
+	return;
+}
+
+void hand_socketGas(int& s, mad_n::Bag& bag) {
+	int buf;
+	if (recvfrom(s, reinterpret_cast<void *>(&buf), sizeof(buf), 0, NULL, NULL)
+			!= sizeof(buf))
+		return;
+	if (buf == FROM_GASIC_STOP)
+		bag.stopSessionGasik();
+	else if (buf == FROM_GASIC_START)
+		bag.startSessionGasik();
+	else
+		cerr << "Неизвестная команда получена от оповещателя Гасик";
+}
+
 void message_about_receiv(mad* mad, DataUnit* buf) {
+	string message;
+	if (buf->ident == SIGNAL_SAMPL)
+		message = "Получено событие от мада № ";
+	else if (buf->ident == SIGNAL_GASIC)
+		message = "Получен сигнал Гасик от мада № ";
 	char cur_time[26];
 	unsigned add_s = buf->numFirstCount / SAMPLING_RATE;
 	unsigned num_us =
@@ -316,14 +427,13 @@ void message_about_receiv(mad* mad, DataUnit* buf) {
 	time_t tim = static_cast<time_t>(buf->time + add_s);
 	tm* t = localtime(&tim);
 	strftime(cur_time, sizeof(cur_time), "%x %X", t);
-	cout << mad->color << "Получено событие от мада № " << buf->id_MAD
-			<< ".  Время детектирования: " << cur_time << " :  " << num_us
-			<< "us\033[0m\n";
+	cout << mad->color << message << buf->id_MAD << ".  Время детектирования: "
+			<< cur_time << " :  " << num_us << "us\033[0m\n";
 	return;
 }
 
 void hand_stat(StatAlg* buf, size_t size, mad* mad, int idmad) {
-	//проверка изменился ли день
+//проверка изменился ли день
 	if (mad[idmad].day_for_stat != statp.day) {
 		mad[idmad].day_for_stat = statp.day;
 		mad[idmad].f_t.close();
@@ -333,7 +443,7 @@ void hand_stat(StatAlg* buf, size_t size, mad* mad, int idmad) {
 						+ statp.name_month + "_" + to_string(buf->id_MAD) + "_t").c_str(),
 				ios::out | ios::app);
 	}
-	//заполнение файла статистики алгоритма
+//заполнение файла статистики алгоритма
 	mad[idmad].f_t << left << setw(12) << buf->time;
 	mad[idmad].f_t << left << setw(12) << buf->average;
 	mad[idmad].f_t << left << setw(12) << buf->maximum;
