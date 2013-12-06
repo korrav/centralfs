@@ -20,19 +20,23 @@ namespace mad_n {
 class Bag {
 	static int buf_[SIZE_BUF]; //буфер, содержащий сообщение, передаваемое в БЭГ
 	static unsigned size_buf_; //длина сообщения, передаваемого в БЭГ
-	enum idCommand_ {
+	enum idCommand {
 		TO_BEG_STOP_GASIC, TO_BEG_START_GASIC
 	}; //идентификаторы команд БЭГ
-	enum idAnswer_ {
+	enum idAnswer {
 		FROM_BEG_STOP_GASIC, FROM_BEG_START_GASIC
 	}; //идентификаторы ответов БЭГ
+	enum destination {
+		BAG = -1, MADS
+	}; //адресаты команды; БЭГ и все отслеживаемые Мад, соответственно
 	static int sock_; //дескриптор сокета коммуницирования с БЭГ
 	static sockaddr_in addrBag_; //адрес БЭГ
 	unsigned int period_; //время текущего периода испускания сигнала SIGALR
 	static enum mode {
 		START_GASIK, STOP_GASIK
 	} mode_;
-	static void instruct(int const* buf = nullptr, unsigned const& size = 0); //передача команды в БЭГ
+	static void instruct(enum destination dest = MADS, int const* buf = nullptr,
+			unsigned const& size = 0); //передача команды в БЭГ
 public:
 	static unsigned int const TIME_COMMAND_TO_BEG; //время повторного отправления команды в БЭГ, если не был получен ответ на предыдущую команду
 	static unsigned int const TIME_SESSION_GASIC; //время сессии Гасик. Если по истечению времени не получено указание остановить сессию Гасик,

@@ -30,7 +30,7 @@ void Bag::startSessionGasik(void) {
 		return;
 	int buf = TO_BEG_START_GASIC;
 	unsigned size = 1;
-	instruct(&buf, size);
+	instruct(MADS, &buf, size);
 	mode_ = START_GASIK;
 	return;
 }
@@ -41,16 +41,17 @@ void Bag::stopSessionGasik(void) {
 		return;
 	int buf = TO_BEG_STOP_GASIC;
 	unsigned size = 1;
-	instruct(&buf, size);
+	instruct(MADS, &buf, size);
 	mode_ = Bag::STOP_GASIK;
 	return;
 }
 
-void Bag::instruct(const int* buf, unsigned const& size) {
+void Bag::instruct(enum destination dest, const int* buf, unsigned const& size) {
 	struct sigaction act;
 	if (buf != nullptr) {
-		size_buf_ = size;
-		for (unsigned i = 0; i < size_buf_; i++)
+		size_buf_ = size + 1;
+		buf_[0] = dest;
+		for (unsigned i = 1; i < size_buf_; i++)
 			buf_[i] = buf[i];
 	}
 	sendto(sock_, reinterpret_cast<void*>(buf_), size_buf_ * sizeof(int), 0,
@@ -68,9 +69,9 @@ void Bag::handRetransmit(int) {
 }
 
 void Bag::passAnswerFromBag(const int* buf, unsigned size) {
-	if (size == 0)
+	if (size < 2)
 		return;
-	switch (*buf) {
+	switch (buf[1]) {
 	case FROM_BEG_STOP_GASIC:
 		if (size == 1)
 			alarm(0);

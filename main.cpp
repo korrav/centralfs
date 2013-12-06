@@ -110,7 +110,7 @@ enum {
 };
 
 //СТРУКТУРА УПРАВЛЯЮЩИХ ПАКЕТОВ РЕЖИМА ГАСИК, ОТПРАВЛЯЕМЫХ ИЗ БЭГ В БЦ
-#define CONTROL_GASIC 7	 //код, идентифицирующий блок данных сигнала Гасик
+#define CONTROL_BAG 7	 //код, идентифицирующий блок данных сигнала Гасик
 /*структура управляющих пакетов Гасик не определена*/
 
 sockaddr_in addrBag;
@@ -302,9 +302,10 @@ void hand_socket(int& s, mad* mad, const int& num, mad_n::Bag& bag) {
 		hand_stat(reinterpret_cast<StatAlg*>(statp.buf), statp.len, mad,
 				reinterpret_cast<StatAlg*>(statp.buf)->id_MAD - 1);
 		cout << "Принят пакет статистики\n";
-	} else if (statp.len != 0 && statp.buf[0] == CONTROL_GASIC) {
+	} else if (statp.len != 0 && statp.buf[0] == CONTROL_BAG) {
 		bag.passAnswerFromBag(&statp.buf[1],
 				sizeof(statp.len) / sizeof(int) - 1);
+		cout << "Принят блок управления от БЭГ\n";
 
 	} else
 		cerr << "Принят неизвестный пакет данных\n";
