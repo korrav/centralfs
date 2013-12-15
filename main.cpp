@@ -37,6 +37,7 @@
 #define CATALOG "/home/x/file_of_andrej/data"
 #define LEN_RECEIVE_BUF 4100 //длина приёмного буфера
 #define SAMPLING_RATE 187500
+#define MAX_SIZE_SAMPL 4100//определяет максимальный размер буфера приёма
 using namespace std;
 enum GasikMode { //режимы записи данных позиционирования
 	SINGLE_FILE, SEPARATE_FILES
@@ -84,15 +85,25 @@ struct Monitor {
 
 //ШАПКА СТРУКТУРЫ ПЕРЕДАЧИ ДАННЫХ
 #define SIGNAL_SAMPL 3	 //код, идентифицирующий блок данных сигнала
-#define SIGNAL_GASIC 6	 //код, идентифицирующий блок данных сигнала Гасик
 struct DataUnit {
 	unsigned int time;	//время отправления
 	int ident; //идентификатор блока данных
 	int mode; //режим сбора данных
+	int gain[4]; //текущий коэффициент усиления (в абсолютных значениях)
 	unsigned int numFirstCount; //номер первого отсчёта
 	int amountCount; //количество отсчётов (1 отс = 4 x 4 байт)
 	unsigned int id_MAD; //идентификатор МАДа
 };
+
+enum mode {
+	PREVIOUS = -1, //возвращение к предыдущим установкам МАД
+	CONTINUOUS, //непрерывный поток данных
+	DETECTION1, //фильтрованный поток данных (1 алгоритм распознавания)
+	SILENCE, //режим молчания
+	ALGORITHM1,	//режим первого алгоритма
+	GASIK //режим Гасик
+};
+//режимы сбора данных
 
 #define STAT_ALG 5 //идентификатор пакета статистики алгоритма
 //СТРУКТУРА СТАТИСТИКИ
@@ -115,7 +126,7 @@ enum {
 
 sockaddr_in addrBag;
 
-static void hand_command(void);
+static void hand_command(mad_n::Bag& bag);
 static void hand_socket(int& s, mad* mad, const int& num, mad_n::Bag& bag);
 static void hand_socketGas(int& s, mad_n::Bag& bag); //обработка сообщения оповещевателя Гасик
 static void hand_monitor(Monitor* buf, size_t size, mad* mad, int idmad); //обработчик мониторограмм
@@ -181,9 +192,15 @@ int main(int argc, char* argv[]) {
 		std::cerr << "socket  not bind\n";
 		exit(1);
 	}
+	//
+	int sizeRec = 2 * MAX_SIZE_SAMPL * 4 * sizeof(int);
+	if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &sizeRec, sizeof(int)) == -1) {
+		std::cerr << "Не поддерживается объём приёмного буфера в размере"
+				<< sizeRec << " байт";
+		return 1;
+	}
 	//инициализация сокета приёма данных от оповещевателя Гасик
-	int sockGas;
-	sockGas = socket(AF_INET, SOCK_DGRAM, 0);
+	int sockGas = socket(AF_INET, SOCK_DGRAM, 0);
 	if (sockGas == -1) {
 		std::cerr << "socket  not create\n";
 		exit(1);
@@ -243,28 +260,36 @@ int main(int argc, char* argv[]) {
 			}
 		}
 		if (FD_ISSET(STDIN_FILENO, &fdin))
-			hand_command();
+			hand_command(bag);
 		if (FD_ISSET(sock, &fdin)) {
-			hand_socket(sock, mads, 3, bag);
 			cout << "Приняты данные на сокете\n";
+			hand_socket(sock, mads, 3, bag);
 		}
-		if (FD_ISSET(sock, &fdin)) {
-			hand_socketGas(sockGas, bag);
+		if (FD_ISSET(sockGas, &fdin)) {
 			cout << "Приняты данные на от оповещевателя Гасик\n";
+			hand_socketGas(sockGas, bag);
 		}
 	}
 	return 0;
 }
 
 //обработчик инструкций командной строки
-void hand_command(void) {
+void hand_command(mad_n::Bag& bag) {
 	string comlin;
 	getline(cin, comlin);
-	if (comlin == "onWrite")
+	if (comlin == "onWrite") {
 		statp.isEnableWr = true;
-	else if (comlin == "offWrite")
+		std::cout << "Запись на диск разрешена\n";
+	} else if (comlin == "offWrite") {
 		statp.isEnableWr = false;
-	else
+		std::cout << "Запись на диск запрещена\n";
+	} else if (comlin == "startG") {
+		bag.startSessionGasik();
+		std::cout << "Запущен сеанс Гасик\n";
+	} else if (comlin == "stopG") {
+		bag.stopSessionGasik();
+		std::cout << "Остановлен сеанс Гасик\n";
+	} else
 		cout << "Неизвестная команда\n";
 	return;
 }
@@ -287,15 +312,13 @@ void hand_socket(int& s, mad* mad, const int& num, mad_n::Bag& bag) {
 	} else if (statp.len > sizeof(DataUnit)
 			&& (reinterpret_cast<DataUnit*>(statp.buf)->ident == SIGNAL_SAMPL)
 			&& (reinterpret_cast<DataUnit*>(statp.buf)->id_MAD <= statp.nummad)) {
-		hand_data(reinterpret_cast<DataUnit*>(statp.buf), statp.len, mad,
-				reinterpret_cast<DataUnit*>(statp.buf)->id_MAD - 1);
-		cout << "Принят блок данных\n";
-	} else if (statp.len > sizeof(DataUnit)
-			&& (reinterpret_cast<DataUnit*>(statp.buf)->ident == SIGNAL_GASIC)
-			&& (reinterpret_cast<DataUnit*>(statp.buf)->id_MAD <= statp.nummad)) {
-		hand_data_gasik(reinterpret_cast<DataUnit*>(statp.buf), statp.len, mad,
-				reinterpret_cast<DataUnit*>(statp.buf)->id_MAD - 1);
-		cout << "Принят блок данных сигнала Гасик\n";
+		if (reinterpret_cast<DataUnit*>(statp.buf)->mode == GASIK)
+			hand_data_gasik(reinterpret_cast<DataUnit*>(statp.buf), statp.len,
+					mad, reinterpret_cast<DataUnit*>(statp.buf)->id_MAD - 1);
+		else
+			hand_data(reinterpret_cast<DataUnit*>(statp.buf), statp.len, mad,
+					reinterpret_cast<DataUnit*>(statp.buf)->id_MAD - 1);
+
 	} else if (statp.len == sizeof(StatAlg)
 			&& (reinterpret_cast<StatAlg*>(statp.buf)->ident == STAT_ALG)
 			&& (reinterpret_cast<StatAlg*>(statp.buf)->id_MAD <= statp.nummad)) {
@@ -308,7 +331,8 @@ void hand_socket(int& s, mad* mad, const int& num, mad_n::Bag& bag) {
 		cout << "Принят блок управления от БЭГ\n";
 
 	} else
-		cerr << "Принят неизвестный пакет данных\n";
+		cerr << "Принят неизвестный пакет данных размером в " << statp.len
+				<< " байт" << std::endl;
 	statp.len = 0;
 
 	return;
@@ -416,10 +440,10 @@ void hand_socketGas(int& s, mad_n::Bag& bag) {
 
 void message_about_receiv(mad* mad, DataUnit* buf) {
 	string message;
-	if (buf->ident == SIGNAL_SAMPL)
-		message = "Получено событие от мада № ";
-	else if (buf->ident == SIGNAL_GASIC)
+	if (buf->mode == GASIK)
 		message = "Получен сигнал Гасик от мада № ";
+	else if (buf->ident == SIGNAL_SAMPL)
+		message = "Получено событие от мада № ";
 	char cur_time[26];
 	unsigned add_s = buf->numFirstCount / SAMPLING_RATE;
 	unsigned num_us =
@@ -428,8 +452,10 @@ void message_about_receiv(mad* mad, DataUnit* buf) {
 	time_t tim = static_cast<time_t>(buf->time + add_s);
 	tm* t = localtime(&tim);
 	strftime(cur_time, sizeof(cur_time), "%x %X", t);
-	cout << mad->color << message << buf->id_MAD << ".  Время детектирования: "
-			<< cur_time << " :  " << num_us << "us\033[0m\n";
+	cout << mad->color << message << buf->id_MAD
+			<< ".\n  Время детектирования: " << cur_time << " :  " << num_us
+			<< std::endl << "Количество отсчётов: " << buf->amountCount
+			<< " us\033[0m\n";
 	return;
 }
 
